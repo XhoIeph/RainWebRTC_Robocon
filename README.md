@@ -38,17 +38,6 @@ idf.py flash monitor
 
 原 BSP: [WTDKP4C5-S1](https://github.com/wireless-tag-com/WTDKP4C5-S1)
 
-- 🎯 **Smartphone-style UI Interface** - Built on ESP-Brookesia framework
-- 📱 **Multiple Applications** - Calculator, music player, video player, 2048 game, camera app
-- 🤖 **AI Vision Features** - Face detection and pedestrian detection
-- 🖥️ **High-definition Display** - Supports MIPI DSI interface display
-- 🌐 **Network Connectivity** - WiFi and Ethernet support
-- 📷 **Camera Support** - 1280x960 resolution camera
-
-## Environment Setup
-
-### Hardware Requirements
-
 - **Development Board**: WTDKP4C5-S1-1V1 development board
 
 ![WTDKP4C5-S1-1V1](./docs/WTDKP4C5-S1-1V1.png#pic_center)
