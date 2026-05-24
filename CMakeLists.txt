@@ -20,4 +20,8 @@ add_compile_options(
 )
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-enum-enum-conversion")
+
+# P0: Disable LVGL graphics library in BSP (no display)
+add_compile_definitions(BSP_CONFIG_NO_GRAPHIC_LIB=1 LV_USE_FREETYPE=0 CONFIG_HUMAN_FACE_DETECT_MODEL_TYPE=0 CONFIG_PEDESTRIAN_DETECT_MODEL_TYPE=0)
+
 project(wtdkp4c5_s1_board)

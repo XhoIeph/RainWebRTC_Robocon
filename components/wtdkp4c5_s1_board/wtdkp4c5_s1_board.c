@@ -675,6 +675,8 @@ void bsp_touch_delete(void)
     }
 }
 
+#if (BSP_CONFIG_NO_GRAPHIC_LIB == 0)
+
 static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
 {
     assert(cfg != NULL);
@@ -721,7 +723,11 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
 
 static lv_indev_t *bsp_display_indev_init(lv_display_t *disp)
 {
-    BSP_ERROR_CHECK_RETURN_NULL(bsp_touch_new(NULL, &tp));
+    esp_err_t err = bsp_touch_new(NULL, &tp);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Touch init failed (err=0x%x), skipping touch input", err);
+        return NULL;
+    }
     assert(tp);
 
     /* Add touch input (for selected screen) */
@@ -807,6 +813,8 @@ void bsp_display_unlock(void)
 {
     lvgl_port_unlock();
 }
+
+#endif // BSP_CONFIG_NO_GRAPHIC_LIB == 0
 
 static void usb_lib_task(void *arg)
 {

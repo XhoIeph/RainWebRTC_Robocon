@@ -2,10 +2,6 @@
 dependencies:
   ## Required IDF version
   idf: ">=5.3"
-  espressif/freetype:
-    version: "*"
-  espressif/esp-brookesia:
-    version: "0.4.*"
   esp_video:
     version: "0.8.*"
     public: true
@@ -17,3 +13,5 @@ dependencies:
     version: "*"
     rules:
       - if: "target in [esp32p4, esp32h2]"
+  espressif/esp_libsrtp:
+    version: "^1.0.0"

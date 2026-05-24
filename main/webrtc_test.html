@@ -1,0 +1,390 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Robot Cam - WebRTC</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:Arial,sans-serif}
+#status{color:#fff;padding:12px 20px;border-radius:20px;margin:10px;font-size:14px;transition:all .3s}
+.status-idle{background:#555}
+.status-connecting{background:#e67e22}
+.status-connected{background:#27ae60}
+.status-error{background:#e74c3c}
+#videoContainer{width:100vw;max-width:100%;aspect-ratio:4/3;background:#111;position:relative;overflow:hidden}
+#remoteVideo{width:100%;height:100%;object-fit:contain;background:#000}
+#log{color:#888;font-size:11px;margin:8px;text-align:center;max-height:60px;overflow-y:auto;word-break:break-all}
+/* Camera controls panel */
+#camCtrl{width:100%;max-width:400px;background:#1a1a2e;border-radius:12px;margin:10px;padding:12px 16px;transition:all .3s}
+#camCtrl h3{color:#ccc;font-size:14px;margin:0 0 10px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px}
+#camCtrl h3 .arrow{transition:transform .3s;display:inline-block}
+#camCtrl.collapsed .ctrlBody{display:none}
+#camCtrl.collapsed h3 .arrow{transform:rotate(-90deg)}
+.ctrlBody{display:flex;flex-direction:column;gap:12px}
+.ctrlRow{display:flex;flex-direction:column;gap:4px}
+.ctrlRow label{color:#aaa;font-size:12px;display:flex;justify-content:space-between}
+.ctrlRow label span{color:#fff;font-weight:bold}
+.ctrlRow input[type=range]{-webkit-appearance:none;width:100%;height:6px;border-radius:3px;background:#333;outline:none}
+.ctrlRow input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:#27ae60;cursor:pointer}
+.toggleRow{display:flex;align-items:center;justify-content:space-between}
+.toggleRow label{color:#aaa;font-size:12px}
+.toggle-btn{padding:6px 14px;border:none;border-radius:16px;font-size:12px;cursor:pointer;transition:all .2s;font-weight:bold}
+.toggle-on{background:#27ae60;color:#fff}
+.toggle-off{background:#e74c3c;color:#fff}
+</style>
+</head>
+<body>
+<div id="status" class="status-idle">🔌 等待连接...</div>
+<div id="videoContainer">
+  <video id="remoteVideo" autoplay playsinline muted></video>
+</div>
+<div id="camCtrl" class="collapsed">
+  <h3 onclick="toggleCamCtrl()"><span class="arrow">▼</span> 📷 相机控制</h3>
+  <div class="ctrlBody" id="ctrlBody">
+    <!-- Dynamically filled by fetchCamStatus -->
+  </div>
+</div>
+<div id="encCtrl" class="collapsed">
+  <h3 onclick="toggleEncCtrl()"><span class="arrow">▼</span> 🎬 编码控制</h3>
+  <div class="ctrlBody">
+    <div class="ctrlRow">
+      <label>码率 <span id="v_bitrate">6</span> Mbps</label>
+      <input type="range" id="s_bitrate" min="2" max="15" step="1" value="6" oninput="onEncSlider('bitrate',this.value)">
+    </div>
+    <div class="ctrlRow">
+      <label>GOP（关键帧间隔）<span id="v_gop">30</span> 帧</label>
+      <input type="range" id="s_gop" min="5" max="60" step="1" value="30" oninput="onEncSlider('gop',this.value)">
+    </div>
+    <div class="ctrlRow">
+      <button class="toggle-btn toggle-on" onclick="forceIDR()" style="width:100%;padding:10px">⚡ 强制刷新 (IDR)</button>
+    </div>
+  </div>
+</div>
+<div id="log"></div>
+
+<script>
+const ESP_IP = '192.168.4.1';
+const SIGNAL_URL = `http://${ESP_IP}/webrtc/signal`;
+
+let pc = null;
+let sse = null;
+let candidatesQueue = [];
+let audioStream = null;
+
+function log(msg){console.log('[CAM]',msg);document.getElementById('log').textContent=msg}
+function setStatus(cls,text){const s=document.getElementById('status');s.className=cls;s.textContent=text}
+
+// ====== Init: get audio mic first (ensures ICE works properly) ======
+async function init(){
+  try {
+    audioStream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+    log('Audio mic ready');
+  } catch(e) {
+    log('No audio mic: '+e.name+' (continuing without)');
+  }
+  connectSignaling();
+}
+
+function connectSignaling(){
+  if (sse) { sse.close(); sse = null; }
+  sse = new EventSource(SIGNAL_URL);
+  sse.onopen = () => { log('SSE connected'); candidatesQueue = []; };
+  sse.onerror = () => {
+    log('SSE error, will retry...');
+    setStatus('status-error','SSE 断开，自动重连中...');
+    // Do NOT close RTCPeerConnection when SSE drops!
+    // The peer can keep streaming without signaling channel
+  };
+  sse.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'connected') {
+        log('SSE ready, creating peer...');
+        setStatus('status-connecting','建立 WebRTC 连接...');
+        createPeerConnection();
+      } else if (msg.type === 'offer') {
+        handleOffer(msg.sdp);
+      } else if (msg.type === 'candidate') {
+        handleCandidate(msg.candidate);
+      } else if (msg.type === 'heartbeat') {
+        // keepalive
+      } else if (msg.type === 'status') {
+        log('Status: '+msg.state);
+        if (msg.state === 'connected') {
+          if (pc && pc.connectionState === 'connected') {
+            // Already have a working connection — just update UI
+            setStatus('status-connected','视频流已连接（复用）');
+          } else {
+            // No PC yet or PC failed — SSE will auto-reconnect and trigger new negotiation
+            log('Waiting for new connection...');
+            setStatus('status-connecting','等待连接...');
+          }
+        }
+      } else {
+        log('Unknown msg: '+msg.type);
+      }
+    } catch(err){ log('Parse: '+err) }
+  };
+}
+
+function createPeerConnection(){
+  if (pc) { pc.close(); }
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+  });
+
+  // Audio: add real mic track (ICE needs at least one send-capable track)
+  // Video: NO addTransceiver — let setRemoteDescription auto-create from offer
+  if (audioStream) {
+    audioStream.getTracks().forEach(track => {
+      pc.addTrack(track, audioStream);
+      log('Audio track added');
+    });
+  }
+
+  pc.ontrack = e => {
+    log('Got remote track! kind=' + e.track.kind);
+    if (e.track.kind === 'video') {
+      document.getElementById('remoteVideo').srcObject = e.streams[0];
+      setStatus('status-connected','视频流已连接');
+    }
+  };
+
+  pc.onicecandidate = e => {
+    if (e.candidate) {
+      log('ICE candidate: '+e.candidate.candidate.substr(0,60));
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    log('ICE state: '+pc.iceConnectionState);
+  };
+
+  pc.onconnectionstatechange = () => {
+    log('Connection: '+pc.connectionState);
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      setStatus('status-error','连接断开，刷新重试');
+    }
+  };
+}
+
+async function handleOffer(sdpStr){
+  log('Got offer ('+sdpStr.length+'B)');
+  try {
+    await pc.setRemoteDescription({ type: 'offer', sdp: sdpStr });
+    log('Remote desc set');
+
+    // Process queued remote candidates
+    while(candidatesQueue.length){
+      const c = candidatesQueue.shift();
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: 'a='+c, sdpMid: '0', sdpMLineIndex: 0
+        }));
+      } catch(e){ log('Queued ICE err: '+e) }
+    }
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // Wait for ICE gathering with 3s timeout (host candidates arrive fast)
+    if (pc.iceGatheringState !== 'complete') {
+      log('ICE gathering...');
+      await Promise.race([
+        new Promise(resolve => {
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') resolve();
+          };
+          if (pc.iceGatheringState === 'complete') resolve();
+        }),
+        new Promise(resolve => setTimeout(() => { log('ICE gather timeout (8s)'); resolve(); }, 8000))
+      ]);
+    }
+
+    log('Sending answer ('+(pc.localDescription?.sdp?.length||0)+'B)');
+    postSignal({ type: 'answer', sdp: pc.localDescription.sdp });
+  } catch(err){
+    log('SDP error: '+err);
+    setStatus('status-error','SDP 协商失败: '+err);
+  }
+}
+
+function handleCandidate(candidateStr){
+  log('Remote ICE: '+candidateStr.substr(0,40));
+  if (!pc || !pc.remoteDescription) {
+    candidatesQueue.push(candidateStr);
+    return;
+  }
+  try {
+    const c = new RTCIceCandidate({ candidate: 'a='+candidateStr, sdpMid: '0', sdpMLineIndex: 0 });
+    pc.addIceCandidate(c).catch(e => log('ICE add err: '+e));
+  } catch(err){ log('ICE parse err: '+err) }
+}
+
+async function postSignal(data){
+  try {
+    let resp = await fetch(SIGNAL_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!resp.ok) log('POST HTTP '+resp.status);
+  } catch(err){ log('POST err: '+err) }
+}
+
+// ====== Camera Controls ======
+const CAM_API = `http://${ESP_IP}/camera`;
+let camDebounce = {};
+let camCtrls = {};  // cid -> {value, min, max, step}
+
+function toggleCamCtrl(){
+  document.getElementById('camCtrl').classList.toggle('collapsed');
+}
+
+async function fetchCamStatus(){
+  try {
+    let resp = await fetch(`${CAM_API}/status`);
+    if (!resp.ok) return;
+    let data = await resp.json();
+    if (!data.controls) return;
+    buildCamUI(data.controls);
+  } catch(e) { log('Cam status: '+e); }
+}
+
+function buildCamUI(controls){
+  // Chinese display labels for each control
+  const LABELS = {
+    exposure: '曝光时间 (×100µs)'
+  };
+  let body = document.getElementById('ctrlBody');
+  let html = '';
+  for (let c of controls) {
+    camCtrls[c.cid] = { value: c.value, min: c.min, max: c.max, step: c.step, status: c.status };
+    let label = LABELS[c.cid] || c.desc;
+    if (c.cid === 'vflip' || c.cid === 'hflip') {
+      let on = (c.value === 1);
+      html += `<div class="toggleRow">
+        <label>${label}</label>
+        <button id="btn_${c.cid}" class="toggle-btn ${on?'toggle-on':'toggle-off'}" onclick="toggleFlip('${c.cid}')">${on?'ON':'OFF'}</button>
+      </div>`;
+    } else {
+      html += `<div class="ctrlRow">
+        <label>${label} <span id="v_${c.cid}">${c.value}</span></label>
+        <input type="range" id="s_${c.cid}" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" oninput="onSlider('${c.cid}',this.value)">
+      </div>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+function onSlider(cid, val){
+  document.getElementById('v_'+cid).textContent = val;
+  if (camDebounce[cid]) clearTimeout(camDebounce[cid]);
+  camDebounce[cid] = setTimeout(() => postCamCtrl(cid, parseInt(val)), 150);
+}
+
+function toggleFlip(cid){
+  let cur = camCtrls[cid].value;
+  let next = cur ? 0 : 1;
+  postCamCtrl(cid, next);
+  camCtrls[cid].value = next;
+  let btn = document.getElementById('btn_'+cid);
+  btn.textContent = next ? 'ON' : 'OFF';
+  btn.className = 'toggle-btn ' + (next ? 'toggle-on' : 'toggle-off');
+}
+
+async function postCamCtrl(cid, value){
+  try {
+    let resp = await fetch(`${CAM_API}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cid: cid, value: value })
+    });
+    let data = await resp.json();
+    if (data.result !== 'ok') {
+      log('Cam: '+cid+' '+data.result);
+      // Revert UI to cached value
+      if (camCtrls[cid]) {
+        document.getElementById('v_'+cid).textContent = camCtrls[cid].value;
+        let s = document.getElementById('s_'+cid);
+        if (s) s.value = camCtrls[cid].value;
+      }
+    } else if (data.result === 'ok') {
+      camCtrls[cid].value = data.value;
+    }
+  } catch(e) { log('Cam ctrl err: '+e); }
+}
+
+// ====== Encoder Controls ======
+const ENC_API = `http://${ESP_IP}/encoder`;
+
+function toggleEncCtrl(){
+  document.getElementById('encCtrl').classList.toggle('collapsed');
+}
+
+let encDebounce = {};
+
+function onEncSlider(cmd, val){
+  document.getElementById('v_'+cmd).textContent = val;
+  if (encDebounce[cmd]) clearTimeout(encDebounce[cmd]);
+  if (cmd === 'bitrate') {
+    encDebounce[cmd] = setTimeout(() => postEncCtrl(cmd, parseInt(val) * 1000000), 200);
+  } else if (cmd === 'gop') {
+    encDebounce[cmd] = setTimeout(() => postEncCtrl(cmd, parseInt(val)), 200);
+  }
+}
+
+async function postEncCtrl(cmd, value){
+  try {
+    let resp = await fetch(`${ENC_API}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd: cmd, value: value })
+    });
+    let data = await resp.json();
+    if (data.result === 'ok') {
+      log('Encoder: '+cmd+' = '+value);
+    } else {
+      log('Encoder: '+cmd+' error: '+(data.msg||data.result));
+    }
+  } catch(e) { log('Enc ctrl err: '+e); }
+}
+
+async function forceIDR(){
+  try {
+    let resp = await fetch(`${ENC_API}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd: 'force_idr' })
+    });
+    let data = await resp.json();
+    if (data.result === 'ok') log('IDR forced!');
+  } catch(e) { log('IDR err: '+e); }
+}
+
+async function fetchEncStatus(){
+  try {
+    let resp = await fetch(`${ENC_API}/status`);
+    if (!resp.ok) return;
+    let data = await resp.json();
+    if (data.bitrate) {
+      let mbps = data.bitrate / 1000000;
+      document.getElementById('s_bitrate').value = mbps;
+      document.getElementById('v_bitrate').textContent = mbps;
+    }
+    if (data.gop) {
+      document.getElementById('s_gop').value = data.gop;
+      document.getElementById('v_gop').textContent = data.gop;
+    }
+  } catch(e) {}
+}
+
+// Extend timing: fetch encoder status after camera status
+setTimeout(fetchEncStatus, 3500);
+
+init();
+setTimeout(fetchCamStatus, 3000);
+</script>
+</body>
+</html>
