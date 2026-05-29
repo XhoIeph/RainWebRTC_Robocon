@@ -59,6 +59,25 @@ static TaskHandle_t          g_peer_task = NULL;
 static TaskHandle_t          g_encoder_task = NULL;
 static QueueHandle_t         g_frame_queue = NULL;  // Camera ? Encoder: frame pointers
 static int                   g_camera_fd = -1;      // Camera fd for V4L2 controls
+static bool                  g_is_ap_mode = false;   // Set by main.cpp: AP vs STA
+
+/* ?? CAM2 (AP-side relay for STA device) ?? */
+static esp_peer_handle_t    g_peer2 = NULL;
+static bool                  g_peer2_connected = false;
+static bool                  g_need_idr2 = false;
+static QueueHandle_t         g_sse_queue2 = NULL;
+static bool                  g_sse2_connected = false;
+static bool                  g_sse2_stopping = false;
+static httpd_req_t          *g_sse2_req = NULL;
+static TaskHandle_t          g_peer2_task = NULL;
+static SemaphoreHandle_t     g_peer_open_mutex = NULL;  // serialize esp_peer_open
+
+/* UDP push: STA ? AP (192.168.4.1:9999) */
+#define UDP_PUSH_PORT 9999
+static int                   g_udp_push_sock = -1;
+static struct sockaddr_in    g_udp_push_dest = {};
+
+void webrtc_set_ap_mode(bool is_ap) { g_is_ap_mode = is_ap; }
 
 /* Frame info passed through queue */
 typedef struct {
@@ -132,6 +151,20 @@ static void sse_send_task(void *arg)
 
 static esp_err_t sse_get_handler(httpd_req_t *req)
 {
+    // Debug: log client IP on every SSE attempt
+    int sockfd = httpd_req_to_sockfd(req);
+    char client_ip[16] = "?.?.?.?";
+    if (sockfd >= 0) {
+        struct sockaddr_storage addr;
+        socklen_t addr_len = sizeof(addr);
+        if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) == 0) {
+            if (addr.ss_family == AF_INET) {
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, client_ip, sizeof(client_ip));
+            }
+        }
+    }
+    ESP_LOGI(TAG, "SSE connect from %s (g_sse_connected=%d)", client_ip, (int)g_sse_connected);
+
     httpd_resp_set_type(req, "text/event-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "keep-alive");
@@ -522,7 +555,9 @@ static esp_err_t webrtc_peer_init(void)
         .on_video_info = peer_on_video_info,
     };
 
+    xSemaphoreTake(g_peer_open_mutex, portMAX_DELAY);
     int ret = esp_peer_open(&cfg, esp_peer_get_default_impl(), &g_peer);
+    xSemaphoreGive(g_peer_open_mutex);
     if (ret != ESP_PEER_ERR_NONE) {
         ESP_LOGE(TAG, "esp_peer_open failed: %d", ret);
         return ESP_FAIL;
@@ -548,7 +583,7 @@ static esp_err_t webrtc_peer_reopen(void)
         .rtp_cfg = {
             .audio_recv_jitter = { .cache_size = 1024 },
             .video_recv_jitter = { .cache_size = 1024 },
-            .send_pool_size = 2048 * 1024,
+            .send_pool_size = 512 * 1024,
             .send_queue_num = 128,
         },
         .alive_binding_retries = 10,
@@ -571,7 +606,9 @@ static esp_err_t webrtc_peer_reopen(void)
         .on_video_info = peer_on_video_info,
     };
 
+    xSemaphoreTake(g_peer_open_mutex, portMAX_DELAY);
     int ret = esp_peer_open(&cfg, esp_peer_get_default_impl(), &g_peer);
+    xSemaphoreGive(g_peer_open_mutex);
     if (ret != ESP_PEER_ERR_NONE) {
         ESP_LOGE(TAG, "Peer reopen failed: %d", ret);
         return ESP_FAIL;
@@ -714,6 +751,32 @@ static void encoder_task(void *arg)
                     (int)out_frame.length,
                     out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR ? "IDR" : "P");
                 first_send_logged = true;
+            }
+        }
+
+        // UDP push disabled — C5 AP handles routing independently
+        if (0 && !g_is_ap_mode && out_frame.length > 0 && (g_frame_count & 1)) {
+            if (g_udp_push_sock < 0) {
+                g_udp_push_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                if (g_udp_push_sock >= 0) {
+                    g_udp_push_dest.sin_family = AF_INET;
+                    g_udp_push_dest.sin_port = htons(UDP_PUSH_PORT);
+                    inet_pton(AF_INET, "192.168.4.1", &g_udp_push_dest.sin_addr);
+                }
+            }
+            if (g_udp_push_sock >= 0) {
+                // Send with 4-byte header: [uint32_t length]
+                uint32_t hdr = (uint32_t)out_frame.length;
+                struct iovec iov[2] = {
+                    { .iov_base = &hdr, .iov_len = 4 },
+                    { .iov_base = out_frame.raw_data.buffer, .iov_len = out_frame.length },
+                };
+                struct msghdr msg = {};
+                msg.msg_name = &g_udp_push_dest;
+                msg.msg_namelen = sizeof(g_udp_push_dest);
+                msg.msg_iov = iov;
+                msg.msg_iovlen = 2;
+                sendmsg(g_udp_push_sock, &msg, 0);
             }
         }
 
@@ -1006,8 +1069,184 @@ static esp_err_t encoder_status_get_handler(httpd_req_t *req)
 }
 
 /* ================================================================
+ *  Proxy endpoints for STA device (192.168.4.2)
+ *  Device A (AP) proxies all HTTP traffic to Device B (STA)
+ *  because ESP-Hosted C5 firmware does NOT support STA-to-STA IP forwarding.
+ * ================================================================ */
+
+// Forward decl
+static int proxy_connect_to_sta(void);
+
+#define STA_PROXY_IP   "192.168.4.2"
+#define STA_PROXY_PORT 80
+
+/* POST proxy: forward POST /proxy/sta/signal -> http://192.168.4.2/webrtc/signal */
+static esp_err_t proxy_sta_post_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    // Read request body
+    if (req->content_len > 64 * 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large");
+        return ESP_OK;
+    }
+    char *body = (char *)malloc(req->content_len + 1);
+    if (!body) return ESP_FAIL;
+    int total = 0;
+    while (total < req->content_len) {
+        int r = httpd_req_recv(req, body + total, req->content_len - total);
+        if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT) continue; free(body); return ESP_FAIL; }
+        total += r;
+    }
+    body[total] = '\0';
+
+    // Forward to STA device via proxy helper (with ARP fix + retry)
+    int sock = proxy_connect_to_sta();
+    if (sock < 0) { free(body); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "STA unreachable"); return ESP_OK; }
+
+    // Build HTTP POST request
+    char hdr[1024];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+        "POST /webrtc/signal HTTP/1.0\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n",
+        STA_PROXY_IP, total);
+    send(sock, hdr, hdr_len, 0);
+    send(sock, body, total, 0);
+    free(body);
+
+    // Read response headers
+    char resp_buf[4096];
+    int resp_total = 0;
+    while (resp_total < (int)sizeof(resp_buf) - 1) {
+        int r = recv(sock, resp_buf + resp_total, sizeof(resp_buf) - 1 - resp_total, 0);
+        if (r <= 0) break;
+        resp_total += r;
+    }
+    resp_buf[resp_total] = '\0';
+    close(sock);
+
+    // Find body after \r\n\r\n
+    char *body_start = strstr(resp_buf, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4;
+        httpd_resp_send(req, body_start, resp_total - (body_start - resp_buf));
+    } else {
+        httpd_resp_sendstr(req, "{}");
+    }
+    return ESP_OK;
+}
+
+/* Helper: connect to STA device with retry */
+static int proxy_connect_to_sta(void)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) return -1;
+
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in sta_addr = {};
+    sta_addr.sin_family = AF_INET;
+    sta_addr.sin_port = htons(STA_PROXY_PORT);
+    inet_pton(AF_INET, STA_PROXY_IP, &sta_addr.sin_addr);
+
+    // Retry up to 5 times with increasing delay
+    for (int retry = 0; retry < 5; retry++) {
+        if (connect(sock, (struct sockaddr *)&sta_addr, sizeof(sta_addr)) == 0) {
+            return sock;
+        }
+        ESP_LOGW(TAG, "STA connect retry %d/5: errno=%d", retry + 1, errno);
+        vTaskDelay(pdMS_TO_TICKS(500 + retry * 200));
+        // New socket each retry
+        if (retry < 4) {
+            close(sock);
+            sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (sock < 0) return -1;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
+    }
+    ESP_LOGE(TAG, "STA connect FAILED after 5 retries: errno=%d", errno);
+    close(sock);
+    return -1;
+}
+
+static esp_err_t proxy_sta_sse_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    int sock = proxy_connect_to_sta();
+    if (sock < 0) {
+        httpd_resp_sendstr(req, "data: {\"error\":\"sta_unreachable\"}\n\n");
+        return ESP_OK;
+    }
+
+    // Send SSE request
+    const char *req_str = "GET /webrtc/signal HTTP/1.0\r\nHost: 192.168.4.2\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n";
+    send(sock, req_str, strlen(req_str), 0);
+
+    // Relay SSE events
+    char buf[4096];
+    int chunk_start = 0;
+    int received = 0;
+    for (int i = 0; i < 6000; i++) {  // max ~10 minutes
+        int r = recv(sock, buf + received, sizeof(buf) - 1 - received, 0);
+        if (r <= 0) break;
+        received += r;
+        buf[received] = '\0';
+
+        // Send each complete line
+        char *line_start = buf + chunk_start;
+        char *p = line_start;
+        while (p < buf + received) {
+            if (*p == '\n') {
+                *p = '\0';
+                httpd_resp_send_chunk(req, line_start, strlen(line_start));
+                httpd_resp_send_chunk(req, "\n", 1);
+                line_start = p + 1;
+            }
+            p++;
+        }
+        // Keep unprocessed remainder
+        if (line_start > buf) {
+            int remain = (buf + received) - line_start;
+            if (remain > 0) memmove(buf, line_start, remain);
+            received = remain;
+        } else {
+            received = 0;
+        }
+        chunk_start = 0;
+    }
+
+    close(sock);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* ================================================================
  *  HTTP Server Setup
  * ================================================================ */
+
+// Forward declarations for CAM2 & proxy
+static int proxy_connect_to_sta(void);
+static esp_err_t cam2_sse_get_handler(httpd_req_t *req);
+static esp_err_t cam2_signal_post_handler(httpd_req_t *req);
+static esp_err_t cam2_peer_init(void);
+static void udp_relay_task(void *arg);
 
 // Serve the embedded WebRTC test HTML page
 static esp_err_t html_get_handler(httpd_req_t *req)
@@ -1024,8 +1263,8 @@ static esp_err_t html_get_handler(httpd_req_t *req)
 static esp_err_t webrtc_http_init(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;  // /, /webrtc, /webrtc/signal*3, /camera/control*2, /camera/status, /encoder/control*2, /encoder/status
-    config.stack_size = 6144;
+    config.max_uri_handlers = 20;  // + CAM2 + proxy
+    config.stack_size = 7168;
     config.lru_purge_enable = true;
 
     esp_err_t ret = httpd_start(&g_httpd, &config);
@@ -1128,6 +1367,56 @@ static esp_err_t webrtc_http_init(void)
     };
     httpd_register_uri_handler(g_httpd, &enc_status_uri);
 
+    // ?? STA Proxy endpoints (device A ? device B relay) ??
+    // POST /proxy/sta/signal
+    httpd_uri_t proxy_post_uri = {
+        .uri = "/proxy/sta/signal",
+        .method = HTTP_POST,
+        .handler = proxy_sta_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &proxy_post_uri);
+
+    // OPTIONS /proxy/sta/signal (CORS)
+    httpd_uri_t proxy_post_opt_uri = {
+        .uri = "/proxy/sta/signal",
+        .method = HTTP_OPTIONS,
+        .handler = proxy_sta_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &proxy_post_opt_uri);
+
+    // GET /proxy/sta/signal (SSE relay)
+    httpd_uri_t proxy_sse_uri = {
+        .uri = "/proxy/sta/signal",
+        .method = HTTP_GET,
+        .handler = proxy_sta_sse_get_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &proxy_sse_uri);
+
+    // ?? CAM2 endpoints (camera B via UDP relay) ??
+    // GET /cam2/signal (SSE)
+    httpd_uri_t cam2_sse_uri = {
+        .uri = "/cam2/signal",
+        .method = HTTP_GET,
+        .handler = cam2_sse_get_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &cam2_sse_uri);
+
+    // POST /cam2/signal
+    httpd_uri_t cam2_post_uri = {
+        .uri = "/cam2/signal",
+        .method = HTTP_POST,
+        .handler = cam2_signal_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &cam2_post_uri);
+
+    // OPTIONS /cam2/signal (CORS)
+    httpd_uri_t cam2_opt_uri = {
+        .uri = "/cam2/signal",
+        .method = HTTP_OPTIONS,
+        .handler = cam2_signal_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &cam2_opt_uri);
+
     ESP_LOGI(TAG, "WebRTC HTTP signaling + camera controls ready");
     return ESP_OK;
 }
@@ -1152,6 +1441,20 @@ esp_err_t webrtc_video_init(int camera_fd)
     g_sse_queue = xQueueCreate(WEBRTC_SSE_QUEUE_LEN, sizeof(char *));
     if (!g_sse_queue) {
         ESP_LOGE(TAG, "SSE queue create failed");
+        return ESP_FAIL;
+    }
+
+    // Mutex to serialize esp_peer_open (shared impl not thread-safe)
+    g_peer_open_mutex = xSemaphoreCreateMutex();
+    if (!g_peer_open_mutex) {
+        ESP_LOGE(TAG, "Peer open mutex create failed");
+        return ESP_FAIL;
+    }
+
+    // Create CAM2 SSE message queue (for browser ? CAM2 peer signaling)
+    g_sse_queue2 = xQueueCreate(WEBRTC_SSE_QUEUE_LEN, sizeof(char *));
+    if (!g_sse_queue2) {
+        ESP_LOGE(TAG, "SSE2 queue create failed");
         return ESP_FAIL;
     }
 
@@ -1185,7 +1488,14 @@ esp_err_t webrtc_video_init(int camera_fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "=== WebRTC ready: connect to http://192.168.4.1/webrtc ===");
+    ESP_LOGI(TAG, "=== WebRTC HTTP signaling ready (check main for IP) ===");
+
+    // CAM2: UDP relay listener receives H.264 from STA, forwards via CAM2 peer
+    if (g_is_ap_mode) {
+        xTaskCreatePinnedToCore(udp_relay_task, "udp_relay", 8192, NULL, 12, NULL, 0);
+        ESP_LOGI(TAG, "UDP relay listening on :%d (CAM2 active)", UDP_PUSH_PORT);
+    }
+
     return ESP_OK;
 }
 
@@ -1199,4 +1509,275 @@ void webrtc_start_connection(void)
         ESP_LOGI(TAG, "Starting new WebRTC connection...");
         esp_peer_new_connection(g_peer);
     }
+}
+
+/* ================================================================
+ *  Second Peer (CAM2): relays STA device's H.264 via UDP to browser
+ * ================================================================ */
+
+// ?? CAM2 SSE helpers ??
+static int sse2_send(const char *data)
+{
+    if (!g_sse2_req || !g_sse2_connected) return -1;
+    int len = strlen(data) + strlen("data: ") + strlen("\n\n") + 1;
+    char *buf = (char *)malloc(len);
+    if (!buf) return -1;
+    len = snprintf(buf, len, "data: %s\n\n", data);
+    int ret = httpd_resp_send_chunk(g_sse2_req, buf, len);
+    free(buf);
+    return ret;
+}
+
+static void sse2_push_json(const char *json)
+{
+    if (g_sse2_connected && g_sse_queue2) {
+        char *cpy = strdup(json);
+        if (cpy) xQueueSend(g_sse_queue2, &cpy, 0);
+    }
+}
+
+static void sse2_push_sdp(const char *sdp) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "type", "offer");
+    cJSON_AddStringToObject(r, "sdp", sdp);
+    char *j = cJSON_PrintUnformatted(r);
+    if (j) { sse2_push_json(j); free(j); }
+    cJSON_Delete(r);
+}
+
+static void sse2_push_candidate(const char *c) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "type", "candidate");
+    cJSON_AddStringToObject(r, "candidate", c);
+    char *j = cJSON_PrintUnformatted(r);
+    if (j) { sse2_push_json(j); free(j); }
+    cJSON_Delete(r);
+}
+
+static void sse2_send_task(void *arg)
+{
+    int64_t last_hb = esp_timer_get_time() / 1000;
+    while (!g_sse2_stopping) {
+        char *msg = NULL;
+        if (xQueueReceive(g_sse_queue2, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (msg) { sse2_send(msg); free(msg); }
+        }
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_hb > WEBRTC_SSE_HEARTBEAT_MS) {
+            last_hb = now;
+            sse2_send("{\"type\":\"heartbeat\"}");
+        }
+    }
+    httpd_req_async_handler_complete(g_sse2_req);
+    g_sse2_req = NULL;
+    g_sse2_connected = false;
+    g_sse2_stopping = false;
+    vTaskDelete(NULL);
+}
+
+// ?? CAM2 callbacks ??
+static int peer2_on_state(esp_peer_state_t state, void *ctx)
+{
+    ESP_LOGI(TAG, "CAM2 Peer state: %d", (int)state);
+    if (state == ESP_PEER_STATE_CONNECTED) {
+        g_peer2_connected = true;
+        g_need_idr2 = true;
+        ESP_LOGI(TAG, "=== CAM2 CONNECTED ===");
+    } else if (state == ESP_PEER_STATE_DISCONNECTED || state == ESP_PEER_STATE_CONNECT_FAILED) {
+        g_peer2_connected = false;
+    }
+    return 0;
+}
+
+static int peer2_on_msg(esp_peer_msg_t *msg, void *ctx)
+{
+    if (!msg || !g_sse2_connected) return 0;
+    if (msg->type == ESP_PEER_MSG_TYPE_SDP) {
+        char *s = strndup((char *)msg->data, msg->size);
+        if (s) { sse2_push_sdp(s); free(s); }
+    } else if (msg->type == ESP_PEER_MSG_TYPE_CANDIDATE) {
+        sse2_push_candidate((char *)msg->data);
+    }
+    return 0;
+}
+
+static int peer2_on_video_info(esp_peer_video_stream_info_t *info, void *ctx) { return 0; }
+
+// ?? CAM2 SSE handler: GET /cam2/signal ??
+static esp_err_t cam2_sse_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (g_sse2_connected) {
+        sse2_send("{\"error\":\"CAM2 busy\"}");
+        httpd_resp_send_chunk(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    if (g_peer2 && g_peer2_connected) {
+        sse2_send("{\"type\":\"status\",\"state\":\"connected\"}");
+    } else {
+        // Lazy init CAM2 peer on first browser connection
+        if (!g_peer2 && cam2_peer_init() != ESP_OK) {
+            sse2_send("{\"error\":\"cam2_init_fail\"}");
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_OK;
+        }
+        sse2_send("{\"type\":\"connected\"}");
+    }
+    g_sse2_connected = true;
+    g_sse2_stopping = false;
+    httpd_req_async_handler_begin(req, &g_sse2_req);
+    if (g_sse2_req) xTaskCreate(sse2_send_task, "sse2_send", 4096, NULL, 5, NULL);
+
+    if (g_peer2 && !g_peer2_connected) {
+        esp_peer_new_connection(g_peer2);
+        ESP_LOGI(TAG, "CAM2: new connection initiated");
+    }
+    return ESP_OK;
+}
+
+// ?? CAM2 POST handler: POST /cam2/signal ??
+static esp_err_t cam2_signal_post_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    if (req->method == HTTP_OPTIONS) { httpd_resp_send(req, NULL, 0); return ESP_OK; }
+
+    if (req->content_len > 16 * 1024) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too long"); return ESP_OK; }
+    char *buf = (char *)malloc(req->content_len + 1);
+    if (!buf) return ESP_FAIL;
+    int total = 0;
+    while (total < req->content_len) {
+        int r = httpd_req_recv(req, buf + total, req->content_len - total);
+        if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT) continue; free(buf); return ESP_FAIL; }
+        total += r;
+    }
+    buf[total] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { free(buf); return ESP_OK; }
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (!type || !type->valuestring) { cJSON_Delete(root); free(buf); return ESP_OK; }
+
+    if (strcmp(type->valuestring, "answer") == 0) {
+        cJSON *sdp_j = cJSON_GetObjectItem(root, "sdp");
+        if (sdp_j && sdp_j->valuestring) {
+            esp_peer_msg_t m = { .type = ESP_PEER_MSG_TYPE_SDP, .data = (uint8_t *)sdp_j->valuestring, .size = (int)strlen(sdp_j->valuestring) };
+            if (g_peer2) esp_peer_send_msg(g_peer2, &m);
+        }
+    } else if (strcmp(type->valuestring, "candidate") == 0) {
+        cJSON *cand_j = cJSON_GetObjectItem(root, "candidate");
+        if (cand_j && cand_j->valuestring) {
+            esp_peer_msg_t m = { .type = ESP_PEER_MSG_TYPE_CANDIDATE, .data = (uint8_t *)cand_j->valuestring, .size = (int)strlen(cand_j->valuestring) };
+            if (g_peer2) esp_peer_send_msg(g_peer2, &m);
+        }
+    }
+    httpd_resp_sendstr(req, "OK");
+    cJSON_Delete(root); free(buf);
+    return ESP_OK;
+}
+
+// ?? CAM2 peer task ??
+static void peer2_task(void *arg) {
+    while (1) { if (g_peer2) esp_peer_main_loop(g_peer2); vTaskDelay(pdMS_TO_TICKS(10)); }
+}
+
+// ?? CAM2 peer init ??
+static esp_err_t cam2_peer_init(void)
+{
+    esp_peer_default_cfg_t extra = {};
+    extra.agent_recv_timeout = 1000;
+    extra.rtp_cfg.send_pool_size = 64 * 1024;
+    extra.rtp_cfg.send_queue_num = 32;
+    extra.alive_binding_retries = 10;
+    extra.ice_use_lite_mode = true;
+
+    esp_peer_cfg_t cfg = {
+        .role = ESP_PEER_ROLE_CONTROLLING,
+        .audio_info = { .codec = ESP_PEER_AUDIO_CODEC_G711A, .sample_rate = 8000, .channel = 1 },
+        .video_info = { .codec = ESP_PEER_VIDEO_CODEC_H264, .width = WEBRTC_VIDEO_WIDTH, .height = WEBRTC_VIDEO_HEIGHT, .fps = WEBRTC_VIDEO_FPS },
+        .audio_dir = ESP_PEER_MEDIA_DIR_SEND_ONLY,
+        .video_dir = ESP_PEER_MEDIA_DIR_SEND_ONLY,
+        .no_auto_reconnect = true,
+        .enable_data_channel = false,
+        .extra_cfg = &extra, .extra_size = sizeof(extra), .ctx = NULL,
+        .on_state = peer2_on_state, .on_msg = peer2_on_msg, .on_video_info = peer2_on_video_info,
+    };
+    xSemaphoreTake(g_peer_open_mutex, portMAX_DELAY);
+    int ret = esp_peer_open(&cfg, esp_peer_get_default_impl(), &g_peer2);
+    xSemaphoreGive(g_peer_open_mutex);
+    if (ret != ESP_PEER_ERR_NONE) { ESP_LOGE(TAG, "CAM2 peer open: %d", ret); return ESP_FAIL; }
+    if (xTaskCreatePinnedToCore(peer2_task, "cam2_peer", 8192, NULL, 12, &g_peer2_task, 0) != pdPASS) return ESP_FAIL;
+    ESP_LOGI(TAG, "CAM2 peer initialized");
+    return ESP_OK;
+}
+
+// ?? UDP relay task: receive H.264 from STA, send via CAM2 peer ??
+static void udp_relay_task(void *arg)
+{
+    static uint32_t cam2_fc = 0;
+    static int64_t  cam2_last = 0;
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) { ESP_LOGE(TAG, "UDP relay socket fail"); vTaskDelete(NULL); return; }
+
+    struct sockaddr_in bind_addr = {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(UDP_PUSH_PORT);
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "UDP relay bind fail"); close(sock); vTaskDelete(NULL); return;
+    }
+    ESP_LOGI(TAG, "UDP relay listening on :%d", UDP_PUSH_PORT);
+
+    uint8_t *buf = (uint8_t *)heap_caps_aligned_alloc(128, 256 * 1024,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { close(sock); vTaskDelete(NULL); return; }
+
+    while (1) {
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        int len = recvfrom(sock, buf, 256 * 1024, 0,
+            (struct sockaddr *)&from, &fromlen);
+        if (len <= 4) continue;  // need at least 4-byte header
+
+        // Header: first 4 bytes = frame length
+        uint32_t frame_len;
+        memcpy(&frame_len, buf, 4);
+        if (frame_len == 0 || frame_len > 256 * 1024 || 4 + frame_len > (uint32_t)len) continue;
+
+        // Wait for IDR on new connection
+        uint8_t *nal = buf + 4;
+        if (g_need_idr2) {
+            // Check for IDR: NAL type 5 (0x65 after start code)
+            bool is_idr = false;
+            for (uint32_t i = 0; i + 4 < frame_len; i++) {
+                if (nal[i] == 0 && nal[i+1] == 0 && nal[i+2] == 0 && nal[i+3] == 1) {
+                    uint8_t ntype = nal[i+4] & 0x1F;
+                    if (ntype == 5) { is_idr = true; break; }
+                }
+            }
+            if (!is_idr) continue;
+            g_need_idr2 = false;
+        }
+
+        if (g_peer2_connected && frame_len > 0) {
+            esp_peer_video_frame_t vf = { .pts = (uint32_t)(esp_timer_get_time() / 1000), .data = nal, .size = (int)frame_len };
+            esp_peer_send_video(g_peer2, &vf);
+        }
+
+        cam2_fc++;
+        int64_t now = esp_timer_get_time();
+        if (cam2_fc % 100 == 0 && cam2_last > 0) {
+            float fps = 100.f * 1000000.f / (float)(now - cam2_last);
+            ESP_LOGI(TAG, "CAM2 relay: %.1f fps, frame=%" PRIu32 " size=%" PRIu32, fps, cam2_fc, frame_len);
+        }
+        if (cam2_fc % 100 == 0) cam2_last = now;
+    }
+    free(buf); close(sock);
+    vTaskDelete(NULL);
 }

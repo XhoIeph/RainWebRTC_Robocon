@@ -23,20 +23,22 @@ if (NOT CONFIG_PEDESTRIAN_DETECT_MODEL_IN_SDCARD)
     endif()
 
     set(pack_model_exe ${COMPONENT_DIR}/pack_model.py)
-    add_custom_command(
-        OUTPUT ${packed_model}
-        COMMENT "Move and Pack models..."
-        COMMAND python ${pack_model_exe} --model_path ${models} --out_file ${packed_model}
-        DEPENDS ${models}
-        VERBATIM)
+    if(models)
+        add_custom_command(
+            OUTPUT ${packed_model}
+            COMMENT "Move and Pack models..."
+            COMMAND python ${pack_model_exe} --model_path ${models} --out_file ${packed_model}
+            DEPENDS ${models}
+            VERBATIM)
 
-    if(CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_RODATA)
-        target_add_aligned_binary_data(${COMPONENT_LIB} ${packed_model} BINARY)
-    endif()
+        if(CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_RODATA)
+            target_add_aligned_binary_data(${COMPONENT_LIB} ${packed_model} BINARY)
+        endif()
 
-    if(CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_PARTITION)
-        add_custom_target(pedestrian_detect_model ALL DEPENDS ${packed_model})
-        add_dependencies(flash pedestrian_detect_model)
-        esptool_py_flash_to_partition(flash "pedestrian_det" ${packed_model})
+        if(CONFIG_PEDESTRIAN_DETECT_MODEL_IN_FLASH_PARTITION)
+            add_custom_target(pedestrian_detect_model ALL DEPENDS ${packed_model})
+            add_dependencies(flash pedestrian_detect_model)
+            esptool_py_flash_to_partition(flash "pedestrian_det" ${packed_model})
+        endif()
     endif()
 endif()

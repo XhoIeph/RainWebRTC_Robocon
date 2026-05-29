@@ -4,6 +4,15 @@
  * Browser: RTCPeerConnection (iOS Safari / Chrome / Firefox)
  */
 
+// ──── Device Role: uncomment ONE ────
+// #define DEVICE_ROLE_AP       //AP模式
+#define DEVICE_ROLE_STA         //STA模式
+
+// ──── STA Debug Level (uncomment ONE) ────
+// #define STA_DBG_BARE_WIFI        // ① bare WiFi only ✅ PASSED
+// #define STA_DBG_CAMERA_ONLY   // ② + camera, no WebRTC ✅ PASSED
+#define STA_DBG_FULL          // ③ full stack (expect crash)
+
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -20,12 +29,14 @@
 #include "esp_video_init.h"
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
+#include <lwip/ip4_addr.h>
 #define CACHE_LINE_SIZE 128
 #include "camera/app_video.h"
 
 // WebRTC video interface
 void webrtc_on_yuv_frame(const uint8_t *yuv_data, size_t yuv_len);
 esp_err_t webrtc_video_init(int camera_fd);
+void webrtc_set_ap_mode(bool is_ap);
 
 static const char *TAG = "main";
 
@@ -50,42 +61,112 @@ static void camera_cb(uint8_t *buf, uint8_t index, uint32_t w, uint32_t h, size_
     if (g_cam_fc % 100 == 0) g_cam_last = now;
 }
 
-// ── WiFi SoftAP Setup ──
+// ── WiFi Setup ──
+
+#ifdef DEVICE_ROLE_AP
+
 static void wifi_ap(void)
 {
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t c = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&c));
 
-    // Unlock 5.8GHz channels for China regulatory domain
-    wifi_country_t country = {
-        .cc = "CN",
-        .schan = 1,
-        .nchan = 13,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL,
-    };
-    esp_wifi_set_country(&country);
+    // Use country code "CN" — firmware handles channel ranges internally
+    esp_wifi_set_country_code("CN", true);
 
     wifi_config_t a = {
         .ap = {
-            .ssid = "ROBOT_CAM",
-            .password = "",
-            .ssid_len = 0,
-            .channel = 149,          // 5.745GHz, CN domain unlocked
-            .authmode = WIFI_AUTH_OPEN,
-            .max_connection = 4,
+            .ssid = "ROBOT_CAM", .password = "",
+            .channel = 149, .authmode = WIFI_AUTH_OPEN, .max_connection = 6,
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    esp_wifi_set_band(WIFI_BAND_5G);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &a));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Confirm actual channel
     wifi_config_t a_read;
     esp_wifi_get_config(WIFI_IF_AP, &a_read);
     ESP_LOGI(TAG, "WiFi AP started on channel %d", a_read.ap.channel);
 }
+
+#else // DEVICE_ROLE_STA
+
+static SemaphoreHandle_t g_sta_ip_got = NULL;
+static char g_sta_ip[16] = "";
+
+static void sta_got_ip_handler(void *arg, esp_event_base_t base,
+                                int32_t id, void *data)
+{
+    ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+    esp_ip4addr_ntoa(&evt->ip_info.ip, g_sta_ip, sizeof(g_sta_ip));
+    ESP_LOGI(TAG, "STA got IP: %s", g_sta_ip);
+    xSemaphoreGive(g_sta_ip_got);
+}
+
+static void sta_wifi_event_handler(void *arg, esp_event_base_t base,
+                                    int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_STA_START)
+        ESP_LOGI(TAG, "WiFi event: STA START");
+    else if (id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "WiFi event: STA CONNECTED");
+    }
+    else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *evt = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "WiFi event: STA DISCONNECTED, reason=%d", evt->reason);
+    }
+}
+
+static void wifi_init(void)
+{
+    g_sta_ip_got = xSemaphoreCreateBinary();
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    // Static IP — avoids DHCP conflict with phone
+    // P4 #1: keep as 192.168.4.10. P4 #2: change to 192.168.4.11.
+    esp_netif_dhcpc_stop(sta_netif);
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 11);  // <-- P4 #1=10, P4 #2=11
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    esp_netif_set_ip_info(sta_netif, &ip_info);
+    strcpy(g_sta_ip, "192.168.4.11");  // <-- match above
+
+    wifi_init_config_t c = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&c));
+
+    // Use country code "CN" — firmware handles channel ranges internally
+    esp_wifi_set_country_code("CN", true);
+
+    wifi_config_t s = {
+        .sta = {
+            .ssid = "ROBOT_CAM", .password = "",
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &s));
+
+    // Register event handlers BEFORE starting WiFi
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               sta_got_ip_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               sta_wifi_event_handler, NULL));
+
+    ESP_LOGI(TAG, "WiFi STA connecting to ROBOT_CAM...");
+    ESP_ERROR_CHECK(esp_wifi_start());
+    vTaskDelay(pdMS_TO_TICKS(500));  // let C5 WiFi stack settle
+    esp_wifi_connect();               // initiate actual connection
+
+    // Block until STA connects (or timeout after 30s)
+    if (xSemaphoreTake(g_sta_ip_got, pdMS_TO_TICKS(30000)) == pdTRUE) {
+        ESP_LOGI(TAG, "WiFi connected, IP: %s", g_sta_ip);
+    } else {
+        ESP_LOGW(TAG, "WiFi STA did not connect within 30s, continuing anyway");
+        strcpy(g_sta_ip, "192.168.4.x"); // fallback
+    }
+}
+
+#endif
 
 // ── Main ──
 extern "C" void app_main(void)
@@ -134,23 +215,54 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(app_video_set_bufs(fd, 3, (const void **)fb));
 
-    // Initialize WiFi SoftAP
+    // Initialize WiFi
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+#ifdef DEVICE_ROLE_AP
+    webrtc_set_ap_mode(true);
     wifi_ap();
+#else
+    webrtc_set_ap_mode(false);
+    wifi_init();
+#endif
 
-    // Initialize WebRTC + H.264 FIRST (DTLS cert needs fresh PSRAM before camera DMA)
+    // WebRTC init — skip for BARE_WIFI and CAMERA_ONLY
+#if !defined(DEVICE_ROLE_STA) || (defined(STA_DBG_FULL))
     ESP_ERROR_CHECK(webrtc_video_init(fd));
-
-    // Start camera streaming AFTER WebRTC init
     ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_cb));
-    ESP_ERROR_CHECK(app_video_stream_task_start(fd, 0));
+#endif
 
+    // Camera stream — skip only for BARE_WIFI
+#if !defined(DEVICE_ROLE_STA) || !defined(STA_DBG_BARE_WIFI)
+    ESP_ERROR_CHECK(app_video_stream_task_start(fd, 0));
+#endif
+
+#if defined(DEVICE_ROLE_STA)
+ #ifdef STA_DBG_BARE_WIFI
+    ESP_LOGI(TAG, "STA BARE WIFI — no camera, no WebRTC");
+ #elif defined(STA_DBG_CAMERA_ONLY)
+    ESP_LOGI(TAG, "STA CAMERA ONLY — streaming, no WebRTC");
+ #else
+    ESP_LOGI(TAG, "STA FULL — camera + WebRTC");
+ #endif
+#endif
+
+    char url[64];
+#ifdef DEVICE_ROLE_AP
+    snprintf(url, sizeof(url), "http://192.168.4.1");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  WebRTC ready!");
     ESP_LOGI(TAG, "  1. Connect to WiFi: ROBOT_CAM");
-    ESP_LOGI(TAG, "  2. Open http://192.168.4.1");
+    ESP_LOGI(TAG, "  2. Open %s", url);
     ESP_LOGI(TAG, "========================================");
+#else
+    snprintf(url, sizeof(url), "http://%s", g_sta_ip);
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  WebRTC ready!");
+    ESP_LOGI(TAG, "  STA IP: %s", g_sta_ip);
+    ESP_LOGI(TAG, "  Open %s in browser", url);
+    ESP_LOGI(TAG, "========================================");
+#endif
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
