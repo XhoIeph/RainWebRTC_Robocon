@@ -2,10 +2,10 @@
  * WebRTC Video Streaming (H.264 over DTLS-SRTP)
  * 
  * Architecture:
- *   Camera(ISP YUV420 O_UYY_E_VYY) ¡ú H.264 HW Encoder ¡ú esp_peer_send_video()
- *   ¡ú DTLS-SRTP ¡ú RTP/UDP ¡ú Browser RTCPeerConnection
+ *   Camera(ISP YUV420 O_UYY_E_VYY) ï¿½ï¿½ H.264 HW Encoder ï¿½ï¿½ esp_peer_send_video()
+ *   ï¿½ï¿½ DTLS-SRTP ï¿½ï¿½ RTP/UDP ï¿½ï¿½ Browser RTCPeerConnection
  * 
- * Signaling: HTTP SSE (ESP¡úBrowser) + POST (Browser¡úESP)
+ * Signaling: HTTP SSE (ESPï¿½ï¿½Browser) + POST (Browserï¿½ï¿½ESP)
  */
 
 #include <stdio.h>
@@ -28,23 +28,24 @@
 #include "cJSON.h"
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
+#include "driver/uart.h"
 
 #define TAG "WEBRTC"
 
 /* ?? Configuration ??????????????????????????????????????????????? */
 #define WEBRTC_VIDEO_WIDTH      1280
 #define WEBRTC_VIDEO_HEIGHT     720         // 16:9 crop from 960p sensor (full H-FOV)
-#define WEBRTC_VIDEO_FPS          30          // 30fps — buttery smooth
+#define WEBRTC_VIDEO_FPS          30          // 30fps ï¿½ buttery smooth
 #define WEBRTC_VIDEO_GOP          15          // Keyframe every 1s
-#define WEBRTC_VIDEO_BITRATE  (6 * 1024 * 1024)  // 6 Mbps — faster WiFi throughput
+#define WEBRTC_VIDEO_BITRATE  (6 * 1024 * 1024)  // 6 Mbps ï¿½ faster WiFi throughput
 #define WEBRTC_VIDEO_QP_MIN       28          // Tighter compression for speed
 #define WEBRTC_VIDEO_QP_MAX       35          // Motion scenes stay clean
 #define WEBRTC_YUV_SIZE       (WEBRTC_VIDEO_WIDTH * WEBRTC_VIDEO_HEIGHT * 3 / 2)
-#define WEBRTC_H264_MAX_SIZE  (2048 * 1024)  // 2MB — IDR frame headroom
+#define WEBRTC_H264_MAX_SIZE  (2048 * 1024)  // 2MB ï¿½ IDR frame headroom
 #define WEBRTC_SSE_QUEUE_LEN      16        // Max pending messages in SSE queue (browser signaling)
 #define WEBRTC_SSE_HEARTBEAT_MS  3000       // If no messages sent for this long, send heartbeat to keep connection alive
 
-/* ©¤©¤ Global State ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤ */
+/* ï¿½ï¿½ï¿½ï¿½ Global State ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 static esp_peer_handle_t    g_peer = NULL;
 static esp_h264_enc_handle_t g_h264_enc = NULL;
 static httpd_handle_t        g_httpd = NULL;
@@ -54,7 +55,7 @@ static bool                  g_need_idr = false;  // Force IDR on new connection
 static bool                  g_sse_connected = false;
 static bool                  g_sse_stopping = false;
 static httpd_req_t          *g_sse_req = NULL;
-static SemaphoreHandle_t     g_frame_sem = NULL;  // unused — kept for compat
+static SemaphoreHandle_t     g_frame_sem = NULL;  // unused ï¿½ kept for compat
 static TaskHandle_t          g_peer_task = NULL;
 static TaskHandle_t          g_encoder_task = NULL;
 static QueueHandle_t         g_frame_queue = NULL;  // Camera ? Encoder: frame pointers
@@ -93,14 +94,14 @@ static int                   g_h264_idx = 0;  // Toggle 0?1 each frame
 static uint32_t g_frame_count = 0;
 static int64_t  g_last_fps_time = 0;
 
-/* ©¤©¤ Forward Declarations ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤ */
+/* ï¿½ï¿½ï¿½ï¿½ Forward Declarations ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 static int peer_on_state(esp_peer_state_t state, void *ctx);
 static int peer_on_msg(esp_peer_msg_t *msg, void *ctx);
 static int peer_on_video_info(esp_peer_video_stream_info_t *info, void *ctx);
 static esp_err_t webrtc_peer_reopen(void);
 
 /* ================================================================
- *  SSE (Server-Sent Events) for ESP¡úBrowser signaling
+ *  SSE (Server-Sent Events) for ESPï¿½ï¿½Browser signaling
  * ================================================================ */
 
 static int sse_send(httpd_req_t *req, const char *data)
@@ -138,7 +139,7 @@ static void sse_send_task(void *arg)
     g_sse_connected = false;
     g_sse_stopping = false;
     // Only reset peer if it was NOT yet connected (in negotiation phase)
-    // If already streaming, let it continue — SSE is just for signaling
+    // If already streaming, let it continue ï¿½ SSE is just for signaling
     if (g_peer && !g_peer_connected) {
         ESP_LOGI(TAG, "SSE disconnected during negotiation, resetting peer");
         esp_peer_disconnect(g_peer);
@@ -193,25 +194,33 @@ static esp_err_t sse_get_handler(httpd_req_t *req)
     }
 
     // Start or restart WebRTC when browser connects and peer isn't streaming
+    static bool peer_first_connect = true;
     if (g_peer && !g_peer_connected) {
         ESP_LOGI(TAG, "SSE client connected, starting WebRTC negotiation...");
-        // Let old peer cleanup settle before creating new one
-        esp_peer_close(g_peer);
-        g_peer = NULL;
-        vTaskDelay(pdMS_TO_TICKS(200));
-        if (webrtc_peer_reopen() == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        if (peer_first_connect) {
+            // First connection: peer freshly created in webrtc_video_init, use directly
+            peer_first_connect = false;
             esp_peer_new_connection(g_peer);
-            ESP_LOGI(TAG, "Reconnect initiated — waiting for browser answer...");
+            ESP_LOGI(TAG, "First connection started -- waiting for browser answer...");
         } else {
-            ESP_LOGE(TAG, "Peer reopen failed — will retry on next SSE connect");
+            // Reconnect: close+reopen to clean stale state
+            esp_peer_close(g_peer);
+            g_peer = NULL;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (webrtc_peer_reopen() == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                esp_peer_new_connection(g_peer);
+                ESP_LOGI(TAG, "Reconnect initiated -- waiting for browser answer...");
+            } else {
+                ESP_LOGE(TAG, "Peer reopen failed -- will retry on next SSE connect");
+            }
         }
     }
     return ESP_OK;
 }
 
 /* ================================================================
- *  POST /webrtc/signal ¡ª Browser¡úESP (SDP offer/answer, ICE candidates)
+ *  POST /webrtc/signal ï¿½ï¿½ Browserï¿½ï¿½ESP (SDP offer/answer, ICE candidates)
  * ================================================================ */
 
 static esp_err_t signal_post_handler(httpd_req_t *req)
@@ -445,7 +454,7 @@ static int peer_on_state(esp_peer_state_t state, void *ctx)
         g_peer_connected = false;
         ESP_LOGI(TAG, "=== WebRTC %s ===",
             state == ESP_PEER_STATE_DISCONNECTED ? "DISCONNECTED" : "CONNECT FAILED");
-        // Let browser re-trigger reconnect via SSE — don't auto-reconnect here
+        // Let browser re-trigger reconnect via SSE ï¿½ don't auto-reconnect here
         break;
     default:
         break;
@@ -464,7 +473,7 @@ static int peer_on_msg(esp_peer_msg_t *msg, void *ctx)
 
         // Replace Main Profile (4d001f) with Constrained Baseline (42e01f)
         // Also upgrade H.264 level: 42e01f (Lev3.1 max 720p) ? 42e028 (Lev4.0 max 1080p)
-        // Browser decoder reads real 1920×1080 from H.264 SPS in bitstream
+        // Browser decoder reads real 1920ï¿½1080 from H.264 SPS in bitstream
         char *pos = sdp_mod;
         while ((pos = strstr(pos, "profile-level-id=")) != NULL) {
             if (memcmp(pos + 17, "4d001f", 6) == 0) {
@@ -613,7 +622,7 @@ static esp_err_t webrtc_peer_reopen(void)
         ESP_LOGE(TAG, "Peer reopen failed: %d", ret);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Peer reopened — existing task will pick it up");
+    ESP_LOGI(TAG, "Peer reopened ï¿½ existing task will pick it up");
     return ESP_OK;
 }
 
@@ -668,17 +677,17 @@ static esp_err_t h264_encoder_init(void)
 }
 
 /* ================================================================
- *  Frame Callback ¡ª called from camera task with YUV420 frame
+ *  Frame Callback ï¿½ï¿½ called from camera task with YUV420 frame
  * ================================================================ */
 
 /* Frame queue: camera callback ? encoder task */
-#define FRAME_QUEUE_LEN  6  // 6 slots — absorb bursts without dropping
+#define FRAME_QUEUE_LEN  6  // 6 slots ï¿½ absorb bursts without dropping
 
 void webrtc_on_yuv_frame(const uint8_t *yuv_data, size_t yuv_len)
 {
     if (!g_frame_queue) return;
 
-    // Pass pointer directly — camera's 4 DMA buffers provide enough time
+    // Pass pointer directly ï¿½ camera's 4 DMA buffers provide enough time
     // for the encoder task to process before the buffer is reused
     frame_item_t item = { .yuv_data = (uint8_t *)yuv_data, .yuv_len = yuv_len };
     xQueueSend(g_frame_queue, &item, 0);  // Non-blocking, drop if full
@@ -731,7 +740,7 @@ static void encoder_task(void *arg)
         }
         g_need_idr = false;
 
-        // No frame-size drop — QP 18-28 + 6Mbps bitrate control handles frame sizing naturally
+        // No frame-size drop ï¿½ QP 18-28 + 6Mbps bitrate control handles frame sizing naturally
 
         // Send
         if (g_peer_connected && out_frame.length > 0) {
@@ -754,7 +763,7 @@ static void encoder_task(void *arg)
             }
         }
 
-        // UDP push disabled — C5 AP handles routing independently
+        // UDP push disabled ï¿½ C5 AP handles routing independently
         if (0 && !g_is_ap_mode && out_frame.length > 0 && (g_frame_count & 1)) {
             if (g_udp_push_sock < 0) {
                 g_udp_push_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -843,10 +852,10 @@ static esp_err_t camera_ctrl_set(camera_ctrl_t *c, int32_t value)
 
     if (ioctl(g_camera_fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
         if (c->set_works) {
-            // Was working before — now failing, warn
+            // Was working before ï¿½ now failing, warn
             ESP_LOGW(TAG, "cam ctrl SET %s val=%ld FAILED errno=%d", c->name, (long)value, errno);
         }
-        // First failure is silent — we just mark it unavailable
+        // First failure is silent ï¿½ we just mark it unavailable
         c->set_works = false;
         return ESP_FAIL;
     }
@@ -1260,6 +1269,52 @@ static esp_err_t html_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Joystick POST handler: binary packet over UART1 */
+static esp_err_t joystick_post_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    if (req->method == HTTP_OPTIONS) { httpd_resp_send(req, NULL, 0); return ESP_OK; }
+
+    char buf[128] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        int r = httpd_req_recv(req, buf + total, req->content_len - total);
+        if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT) continue; break; }
+        total += r;
+    }
+    buf[total] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_sendstr(req, "{\"result\":\"bad_json\"}"); return ESP_OK; }
+
+    cJSON *jx = cJSON_GetObjectItem(root, "x");
+    cJSON *jy = cJSON_GetObjectItem(root, "y");
+    cJSON *ja = cJSON_GetObjectItem(root, "active");
+    cJSON *jb = cJSON_GetObjectItem(root, "btn");
+    int x = jx ? jx->valueint : 0;
+    int y = jy ? jy->valueint : 0;
+    int active = ja ? ja->valueint : 0;
+    int btn = jb ? jb->valueint : 0;
+
+    ESP_LOGI(TAG, "JOY x=%d y=%d active=%d btn=%d", x, y, active, btn);
+
+    // Binary packet: [0xAA 0xBB] [btn] [x] [y] [active] [0xCC 0xDD]
+    uint8_t pkt[8];
+    pkt[0] = 0xAA; pkt[1] = 0xBB;
+    pkt[2] = (uint8_t)(btn & 1);
+    pkt[3] = (int8_t)x;
+    pkt[4] = (int8_t)y;
+    pkt[5] = (uint8_t)(active & 1);
+    pkt[6] = 0xCC; pkt[7] = 0xDD;
+    uart_write_bytes(UART_NUM_1, pkt, 8);
+
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "{\"result\":\"ok\"}");
+    return ESP_OK;
+}
+
 static esp_err_t webrtc_http_init(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1417,6 +1472,16 @@ static esp_err_t webrtc_http_init(void)
     };
     httpd_register_uri_handler(g_httpd, &cam2_opt_uri);
 
+    // Joystick endpoint
+    httpd_uri_t joystick_uri = {
+        .uri = "/joystick", .method = HTTP_POST, .handler = joystick_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &joystick_uri);
+    httpd_uri_t joystick_opt_uri = {
+        .uri = "/joystick", .method = HTTP_OPTIONS, .handler = joystick_post_handler,
+    };
+    httpd_register_uri_handler(g_httpd, &joystick_opt_uri);
+
     ESP_LOGI(TAG, "WebRTC HTTP signaling + camera controls ready");
     return ESP_OK;
 }
@@ -1436,6 +1501,19 @@ esp_err_t webrtc_video_init(int camera_fd)
     esp_log_level_set("PEER_DEF", ESP_LOG_WARN);
     esp_log_level_set("AGENT", ESP_LOG_NONE);
     esp_log_level_set("UDP", ESP_LOG_NONE);
+
+    // UART1 for joystick serial output (TX only, GPIO 21, 115200 8N1)
+    uart_config_t uart_cfg = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, 21, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_LOGI(TAG, "UART1 joystick TX on GPIO 21 (115200 8N1)");
 
     // Create SSE message queue
     g_sse_queue = xQueueCreate(WEBRTC_SSE_QUEUE_LEN, sizeof(char *));

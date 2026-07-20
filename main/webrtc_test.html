@@ -7,7 +7,20 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#000;font-family:Arial,sans-serif;padding:8px;display:flex;flex-direction:column;align-items:center}
-#videos{display:flex;gap:6px;width:100%;max-width:800px;flex-wrap:wrap;justify-content:center}
+/* 切换栏 */
+#switcher{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;max-width:400px;margin-bottom:6px}
+#switcher button{width:36px;height:36px;border:none;border-radius:50%;background:#1a1a2e;color:#fff;font-size:18px;cursor:pointer}
+#switcher button:active{background:#27ae60}
+#switcher span{color:#fff;font-size:15px;font-weight:bold;min-width:80px;text-align:center}
+/* 横屏: 切换栏竖排靠左 */
+@media(orientation:landscape){
+  #switcher{flex-direction:column;width:auto;max-width:none;margin:0 4px 0 0;gap:4px}
+  #switcher span{font-size:11px;min-width:0;writing-mode:vertical-rl}
+}
+/* 视频裁切容器 */
+#videos{width:100%;max-width:400px;overflow:hidden;border-radius:10px;background:#111;margin-bottom:6px}
+#vidTrack{display:flex;width:200%;transition:transform .25s}
+#vidTrack.atB{transform:translateX(-50%)}
 .camBox{flex:1;min-width:280px;max-width:400px;background:#111;border-radius:10px;overflow:hidden;position:relative}
 .camBox .label{position:absolute;top:4px;left:8px;z-index:2;color:#fff;background:rgba(0,0,0,.6);padding:2px 8px;border-radius:8px;font-size:11px}
 .camBox video{width:100%;aspect-ratio:16/9;object-fit:contain;background:#000;display:block}
@@ -31,20 +44,43 @@ body{background:#000;font-family:Arial,sans-serif;padding:8px;display:flex;flex-
 .toggle-on{background:#27ae60;color:#fff}
 .toggle-off{background:#e74c3c;color:#fff}
 #log{color:#666;font-size:10px;text-align:center;margin:4px;word-break:break-all;max-height:30px;overflow:hidden}
-@media(max-width:600px){#videos{flex-direction:column}.camBox{max-width:100%}}
+/* 摇杆 */
+#joyArea{width:100%;max-width:400px;display:flex;flex-direction:column;align-items:center;margin:8px 0}
+#joyLabel{color:#aaa;font-size:11px;margin-bottom:4px}
+#joyCanvas{border-radius:50%;background:#1a1a2e;touch-action:none;border:2px solid #333}
+/* 横屏: 切换栏左, 画面中, 摇杆右 */
+#mainWrap{display:flex;flex-direction:column;align-items:center;width:100%}
+@media(orientation:landscape){
+  #mainWrap{flex-direction:row;align-items:center;justify-content:center;gap:6px}
+  #mainWrap .leftCol{flex:0 1 auto;max-width:55vw}
+  #mainWrap #joyArea{flex:0 0 auto;max-width:30vw;margin:0}
+  #joyCanvas{width:min(180px,28vw);height:min(180px,28vw)}
+}
+@media(min-width:768px){#joyCanvas{width:220px;height:220px}}
 </style>
 </head>
 <body>
+<div id="mainWrap">
+<!-- 切换栏 -->
+<div id="switcher">
+  <button onclick="switchCam(-1)">&#9664;</button>
+  <span id="camLabel">&#128247; 相机A</span>
+  <button onclick="switchCam(1)">&#9654;</button>
+</div>
+<div class="leftCol">
+<!-- 视频裁切 -->
 <div id="videos">
-  <div class="camBox" id="boxA">
-    <div class="label">📷 相机A (主机)</div>
-    <video id="vA" autoplay playsinline muted></video>
-    <div class="camSt" id="stA">等待</div>
-  </div>
-  <div class="camBox" id="boxB">
-    <div class="label">📷 相机B (从机)</div>
-    <video id="vB" autoplay playsinline muted></video>
-    <div class="camSt" id="stB">等待</div>
+  <div id="vidTrack">
+    <div class="camBox" id="boxA">
+      <div class="label">&#128247; 相机A (主机)</div>
+      <video id="vA" autoplay playsinline muted></video>
+      <div class="camSt" id="stA">等待</div>
+    </div>
+    <div class="camBox" id="boxB">
+      <div class="label">&#128247; 相机B (从机)</div>
+      <video id="vB" autoplay playsinline muted></video>
+      <div class="camSt" id="stB">等待</div>
+    </div>
   </div>
 </div>
 
@@ -70,27 +106,14 @@ body{background:#000;font-family:Arial,sans-serif;padding:8px;display:flex;flex-
   </div>
 </div>
 
-<div id="camCtrlB" class="ctrlPanel collapsed">
-  <h3 onclick="togglePanel('camCtrlB')"><span class="arrow">▼</span> 📷 相机B控制</h3>
-  <div class="ctrlBody" id="camBodyB"></div>
+</div><!-- /leftCol -->
+<!-- 摇杆 -->
+<div id="joyArea">
+  <div id="joyLabel">&#127918; 摇杆 X:0 Y:0</div>
+  <button id="joyBtn" class="toggle-btn toggle-off" onclick="toggleBtn()" style="margin-bottom:8px;padding:8px 20px;font-size:13px">&#128295; 按钮: 关</button>
+  <canvas id="joyCanvas" width="180" height="180" style="margin-top:8px"></canvas>
 </div>
-
-<div id="encCtrlB" class="ctrlPanel collapsed">
-  <h3 onclick="togglePanel('encCtrlB')"><span class="arrow">▼</span> 🎬 相机B编码</h3>
-  <div class="ctrlBody">
-    <div class="ctrlRow">
-      <label>码率 <span id="v_bitrateB">6</span> Mbps</label>
-      <input type="range" id="s_bitrateB" min="2" max="15" step="1" value="6" oninput="onEncValB('bitrate',this.value)">
-    </div>
-    <div class="ctrlRow">
-      <label>GOP <span id="v_gopB">15</span> 帧</label>
-      <input type="range" id="s_gopB" min="5" max="60" step="1" value="15" oninput="onEncValB('gop',this.value)">
-    </div>
-    <div class="ctrlRow">
-      <button class="toggle-btn toggle-on" onclick="forceIDRB()" style="width:100%;padding:8px">⚡ 强制刷新B (IDR)</button>
-    </div>
-  </div>
-</div>
+</div><!-- /mainWrap -->
 <div id="log"></div>
 
 <script>
@@ -161,7 +184,7 @@ function Cam(id, ip){
           waited+=500;
           if(waited>=5000){
             log('Cam'+id+' stuck, forcing IDR');
-            if(id==='A') forceIDR(); else forceIDRB();
+            if(id==='A') forceIDR(); else forceIDR();
             waited=0;
           }
           if(waited>=30000){
@@ -214,6 +237,22 @@ function log(m){console.log(m);let e=document.getElementById('log');if(e)e.textC
 // ── Init both cameras ──
 camA.connect(); camB.connect();
 
+// ── 相机切换 (纯UI, 不碰WebRTC) ──
+function switchCam(dir){
+  let ids=['A','B'], idx=ids.indexOf(activeCam||'A'), newId=ids[(idx+dir+2)%2];
+  if(newId===activeCam) return;
+  activeCam=newId;
+  document.getElementById('vidTrack').classList.toggle('atB', newId==='B');
+  document.getElementById('camLabel').textContent='📷 相机'+newId;
+  document.querySelector('#camCtrl h3').innerHTML='<span class="arrow">▼</span> 📷 相机'+newId+'控制';
+  document.querySelector('#encCtrl h3').innerHTML='<span class="arrow">▼</span> 🎬 相机'+newId+'编码';
+}
+let activeCam='A';
+document.addEventListener('keydown',function(e){
+  if(e.key==='ArrowLeft'){e.preventDefault();switchCam(-1)}
+  if(e.key==='ArrowRight'){e.preventDefault();switchCam(1)}
+});
+
 // Mobile: user tap forces both videos to play (autoplay policy workaround)
 document.body.addEventListener('click',()=>{
   [document.getElementById('vA'),document.getElementById('vB')].forEach(v=>{
@@ -221,17 +260,20 @@ document.body.addEventListener('click',()=>{
   });
 }, {once:false});
 
-// ── Camera A controls (host only) ──
-let camDebounce={}, camCache={};
+// ── 控制面板 (根据activeCam切换相机) ──
+let camDebounceA={},camCacheA={},camDebounceB={},camCacheB={};
+let encDebounceA={},encDebounceB={};
 function togglePanel(id){document.getElementById(id).classList.toggle('collapsed')}
+function apiURL(path){return activeCam==='A'?path:'http://'+CAM_B_IP+path}
 
 async function fetchCam(){
   try{
-    let r=await fetch('/camera/status');if(!r.ok)return;let d=await r.json();
+    let r=await fetch(apiURL('/camera/status'));if(!r.ok)return;let d=await r.json();
     if(!d.controls)return;
+    let cache=activeCam==='A'?camCacheA:camCacheB;
     let h='',L={exposure:'曝光时间 (×100µs)'};
     for(let c of d.controls){
-      camCache[c.cid]={value:c.value,min:c.min,max:c.max,step:c.step};
+      cache[c.cid]={value:c.value,min:c.min,max:c.max,step:c.step};
       let lb=L[c.cid]||c.desc;
       h+=`<div class="ctrlRow"><label>${lb} <span id="v_${c.cid}">${c.value}</span></label><input type="range" id="s_${c.cid}" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" oninput="onCamVal('${c.cid}',this.value)"></div>`;
     }
@@ -240,95 +282,106 @@ async function fetchCam(){
 }
 function onCamVal(id,v){
   document.getElementById('v_'+id).textContent=v;
-  if(camDebounce[id])clearTimeout(camDebounce[id]);
-  camDebounce[id]=setTimeout(()=>postCam(id,parseInt(v)),150);
+  let db=activeCam==='A'?camDebounceA:camDebounceB;
+  if(db[id])clearTimeout(db[id]);
+  db[id]=setTimeout(()=>postCam(id,parseInt(v)),150);
 }
 async function postCam(cid,v){
   try{
-    let r=await fetch('/camera/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:cid,value:v})});
+    let r=await fetch(apiURL('/camera/control'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:cid,value:v})});
     let d=await r.json();
+    let cache=activeCam==='A'?camCacheA:camCacheB;
     if(d.result!=='ok'){log('Cam: '+cid+' '+d.result);
-      if(camCache[cid]){document.getElementById('v_'+cid).textContent=camCache[cid].value;document.getElementById('s_'+cid).value=camCache[cid].value;}
-    }else camCache[cid].value=d.value;
+      if(cache[cid]){document.getElementById('v_'+cid).textContent=cache[cid].value;document.getElementById('s_'+cid).value=cache[cid].value;}
+    }else cache[cid].value=d.value;
   }catch(e){}
 }
 
-// Encoder controls (A only)
-let encDebounce={};
 function onEncVal(cmd,v){
   document.getElementById('v_'+cmd).textContent=v;
-  if(encDebounce[cmd])clearTimeout(encDebounce[cmd]);
-  encDebounce[cmd]=setTimeout(()=>postEnc(cmd,cmd==='bitrate'?parseInt(v)*1000000:parseInt(v)),200);
+  let db=activeCam==='A'?encDebounceA:encDebounceB;
+  if(db[cmd])clearTimeout(db[cmd]);
+  db[cmd]=setTimeout(()=>postEnc(cmd,cmd==='bitrate'?parseInt(v)*1000000:parseInt(v)),200);
 }
 async function postEnc(cmd,v){
-  try{let r=await fetch('/encoder/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd,value:v})});let d=await r.json();if(d.result!=='ok')log('Enc: '+d.result)}catch(e){}
+  try{let r=await fetch(apiURL('/encoder/control'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd,value:v})});let d=await r.json();if(d.result!=='ok')log('Enc: '+d.result)}catch(e){}
 }
 async function forceIDR(){
-  try{let r=await fetch('/encoder/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'force_idr'})});let d=await r.json();if(d.result==='ok')log('IDR done')}catch(e){}
+  try{let r=await fetch(apiURL('/encoder/control'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'force_idr'})});let d=await r.json();if(d.result==='ok')log('IDR done')}catch(e){}
 }
 async function fetchEnc(){
   try{
-    let r=await fetch('/encoder/status');if(!r.ok)return;let d=await r.json();
+    let r=await fetch(apiURL('/encoder/status'));if(!r.ok)return;let d=await r.json();
     if(d.bitrate){let m=d.bitrate/1000000;document.getElementById('s_bitrate').value=m;document.getElementById('v_bitrate').textContent=m}
     if(d.gop){document.getElementById('s_gop').value=d.gop;document.getElementById('v_gop').textContent=d.gop}
   }catch(e){}
 }
 
 setTimeout(fetchCam,3000);setTimeout(fetchEnc,3500);
-setTimeout(fetchCamB,4000);setTimeout(fetchEncB,4500);
 
-// ── Camera B controls (cross-origin) ──
-let camDebounceB={}, camCacheB={};
-const B_URL='http://'+CAM_B_IP;
-
-async function fetchCamB(){
-  try{
-    let r=await fetch(B_URL+'/camera/status');if(!r.ok)return;let d=await r.json();
-    if(!d.controls)return;
-    let h='',L={exposure:'曝光时间 (×100µs)'};
-    for(let c of d.controls){
-      camCacheB[c.cid]={value:c.value,min:c.min,max:c.max,step:c.step};
-      let lb=L[c.cid]||c.desc;
-      h+=`<div class="ctrlRow"><label>${lb} <span id="vB_${c.cid}">${c.value}</span></label><input type="range" id="sB_${c.cid}" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" oninput="onCamValB('${c.cid}',this.value)"></div>`;
-    }
-    document.getElementById('camBodyB').innerHTML=h;
-  }catch(e){}
+// ── 虚拟摇杆 ──
+var joyCanvas=document.getElementById('joyCanvas');
+var joyCtx=joyCanvas.getContext('2d');
+var joyX=0,joyY=0,joyActive=false,joySendTimer=null;
+function joyR(){return joyCanvas.getBoundingClientRect().width/2}
+function joyKr(){return Math.round(joyR()*28/90)}
+function drawJoy(){
+  var r=joyR(),kr=joyKr();
+  joyCtx.clearRect(0,0,joyCanvas.width,joyCanvas.height);
+  joyCtx.save();joyCtx.scale(joyCanvas.width/(r*2),joyCanvas.height/(r*2));
+  joyCtx.beginPath();joyCtx.arc(r,r,r-8,0,Math.PI*2);
+  joyCtx.fillStyle='#111';joyCtx.fill();
+  joyCtx.strokeStyle='#333';joyCtx.lineWidth=2;joyCtx.stroke();
+  joyCtx.strokeStyle='#222';joyCtx.lineWidth=1;
+  joyCtx.beginPath();joyCtx.moveTo(r,8);joyCtx.lineTo(r,r*2-8);joyCtx.stroke();
+  joyCtx.beginPath();joyCtx.moveTo(8,r);joyCtx.lineTo(r*2-8,r);joyCtx.stroke();
+  var kx=r+(joyX/100)*(r-kr-4),ky=r-(joyY/100)*(r-kr-4);
+  joyCtx.beginPath();joyCtx.arc(kx,ky,kr,0,Math.PI*2);
+  joyCtx.fillStyle=joyActive?'#27ae60':'#555';joyCtx.fill();
+  joyCtx.strokeStyle='#888';joyCtx.lineWidth=2;joyCtx.stroke();
+  joyCtx.restore();
+  document.getElementById('joyLabel').textContent='🎮 摇杆 X:'+joyX+' Y:'+joyY+(joyActive?'':' (松手)');
 }
-function onCamValB(id,v){
-  document.getElementById('vB_'+id).textContent=v;
-  if(camDebounceB[id])clearTimeout(camDebounceB[id]);
-  camDebounceB[id]=setTimeout(()=>postCamB(id,parseInt(v)),150);
+var btnState=0;
+function toggleBtn(){
+  btnState=btnState?0:1;
+  var b=document.getElementById('joyBtn');
+  b.textContent='🔧 按钮: '+(btnState?'开':'关');
+  b.className='toggle-btn '+(btnState?'toggle-on':'toggle-off');
+  sendJoy();
 }
-async function postCamB(cid,v){
-  try{
-    let r=await fetch(B_URL+'/camera/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:cid,value:v})});
-    let d=await r.json();
-    if(d.result!=='ok'){log('CamB: '+cid+' '+d.result);
-      if(camCacheB[cid]){document.getElementById('vB_'+cid).textContent=camCacheB[cid].value;document.getElementById('sB_'+cid).value=camCacheB[cid].value;}
-    }else camCacheB[cid].value=d.value;
-  }catch(e){}
+function sendJoy(){
+  fetch('/joystick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:joyX,y:joyY,active:joyActive,btn:btnState})}).catch(function(){});
 }
-
-// ── Encoder B controls ──
-let encDebounceB={};
-function onEncValB(cmd,v){
-  document.getElementById('v_'+cmd+'B').textContent=v;
-  if(encDebounceB[cmd])clearTimeout(encDebounceB[cmd]);
-  encDebounceB[cmd]=setTimeout(()=>postEncB(cmd,cmd==='bitrate'?parseInt(v)*1000000:parseInt(v)),200);
+function setJoy(px,py){
+  var rect=joyCanvas.getBoundingClientRect(),r=joyR(),kr=joyKr();
+  var cx=px-rect.left-r,cy=py-rect.top-r;
+  var dist=Math.sqrt(cx*cx+cy*cy),max=r-kr-4;
+  if(dist>max){cx=cx/dist*max;cy=cy/dist*max}
+  joyX=Math.round(cx/max*100);joyY=Math.round(-cy/max*100);
+  joyX=Math.max(-100,Math.min(100,joyX));joyY=Math.max(-100,Math.min(100,joyY));
+  drawJoy();
 }
-async function postEncB(cmd,v){
-  try{let r=await fetch(B_URL+'/encoder/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd,value:v})});let d=await r.json();if(d.result!=='ok')log('EncB: '+d.result)}catch(e){}
-}
-async function forceIDRB(){
-  try{let r=await fetch(B_URL+'/encoder/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'force_idr'})});let d=await r.json();if(d.result==='ok')log('IDR B done')}catch(e){}
-}
-async function fetchEncB(){
-  try{
-    let r=await fetch(B_URL+'/encoder/status');if(!r.ok)return;let d=await r.json();
-    if(d.bitrate){let m=d.bitrate/1000000;document.getElementById('s_bitrateB').value=m;document.getElementById('v_bitrateB').textContent=m}
-    if(d.gop){document.getElementById('s_gopB').value=d.gop;document.getElementById('v_gopB').textContent=d.gop}
-  }catch(e){}
-}
+function joyDown(e){e.preventDefault();joyActive=true;var p=e.touches?e.touches[0]:e;setJoy(p.clientX,p.clientY);if(!joySendTimer)joySendTimer=setInterval(sendJoy,100)}
+function joyMove(e){if(!joyActive)return;e.preventDefault();var p=e.touches?e.touches[0]:e;setJoy(p.clientX,p.clientY)}
+function joyUp(e){if(!joyActive)return;e.preventDefault();joyActive=false;joyX=0;joyY=0;drawJoy();sendJoy();if(joySendTimer){clearInterval(joySendTimer);joySendTimer=null}}
+joyCanvas.addEventListener('touchstart',joyDown,{passive:false});
+joyCanvas.addEventListener('touchmove',joyMove,{passive:false});
+joyCanvas.addEventListener('touchend',joyUp);
+joyCanvas.addEventListener('touchcancel',joyUp);
+joyCanvas.addEventListener('mousedown',joyDown);
+joyCanvas.addEventListener('mousemove',joyMove);
+joyCanvas.addEventListener('mouseup',joyUp);
+joyCanvas.addEventListener('mouseleave',joyUp);
+// 键盘WASD摇杆
+document.addEventListener('keydown',function(e){
+  switch(e.key){case'w':case'W':e.preventDefault();joyX=0;joyY=100;joyActive=true;drawJoy();if(!joySendTimer)joySendTimer=setInterval(sendJoy,100);break;
+    case's':case'S':e.preventDefault();joyX=0;joyY=-100;joyActive=true;drawJoy();if(!joySendTimer)joySendTimer=setInterval(sendJoy,100);break;
+    case'a':case'A':e.preventDefault();joyX=-100;joyY=0;joyActive=true;drawJoy();if(!joySendTimer)joySendTimer=setInterval(sendJoy,100);break;
+    case'd':case'D':e.preventDefault();joyX=100;joyY=0;joyActive=true;drawJoy();if(!joySendTimer)joySendTimer=setInterval(sendJoy,100);break}});
+document.addEventListener('keyup',function(e){
+  if(['w','W','s','S','a','A','d','D'].indexOf(e.key)>=0){e.preventDefault();joyX=0;joyY=0;joyActive=false;drawJoy();sendJoy();if(joySendTimer){clearInterval(joySendTimer);joySendTimer=null}}});
+drawJoy();
 </script>
 </body>
 </html>
